@@ -1,0 +1,120 @@
+# ─────────────────────────────────────────────
+# Python
+# ─────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+wheels/
+
+# ─────────────────────────────────────────────
+# Virtual Environments
+# ─────────────────────────────────────────────
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# ─────────────────────────────────────────────
+# Jupyter Notebooks
+# ─────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ─────────────────────────────────────────────
+# Data files (large / raw datasets)
+# ─────────────────────────────────────────────
+data/raw_zeek_logs/
+data/results/anomalies.csv
+*.pcap
+*.pcapng
+*.log
+
+# Keep small result summaries
+!data/results/top_suspicious.csv
+
+# General large data formats
+*.parquet
+*.feather
+*.hdf5
+*.h5
+
+# ─────────────────────────────────────────────
+# ML Model artefacts
+# ─────────────────────────────────────────────
+*.pkl
+*.pickle
+*.joblib
+*.pt
+*.pth
+*.onnx
+*.bin
+saved_model/
+checkpoints/
+
+# ─────────────────────────────────────────────
+# Reports & generated outputs
+# ─────────────────────────────────────────────
+evaluation_report.md
+*.png
+*.jpg
+*.jpeg
+confusion_matrix*
+roc_curve*
+pr_curve*
+metrics*.json
+
+# ─────────────────────────────────────────────
+# IDE / Editor
+# ─────────────────────────────────────────────
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# ─────────────────────────────────────────────
+# OS artefacts
+# ─────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─────────────────────────────────────────────
+# Secrets / credentials
+# ─────────────────────────────────────────────
+.env*
+*.key
+*.pem
+secrets.json
+config_local.py
+
+# ─────────────────────────────────────────────
+# Misc
+# ─────────────────────────────────────────────
+*.csv
+!data/results/top_suspicious.csv
+*.tmp
+*.bak
+.cache/

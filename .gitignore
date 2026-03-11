@@ -43,6 +43,8 @@ venv.bak/
 # ─────────────────────────────────────────────
 data/raw_zeek_logs/
 data/results/anomalies.csv
+data/results/metrics_report.json
+data/results/evaluation_report.md
 *.pcap
 *.pcapng
 *.log
@@ -72,14 +74,12 @@ checkpoints/
 # ─────────────────────────────────────────────
 # Reports & generated outputs
 # ─────────────────────────────────────────────
-evaluation_report.md
 *.png
 *.jpg
 *.jpeg
 confusion_matrix*
 roc_curve*
 pr_curve*
-metrics*.json
 
 # ─────────────────────────────────────────────
 # IDE / Editor
@@ -118,3 +118,8 @@ config_local.py
 *.tmp
 *.bak
 .cache/
+
+# ─────────────────────────────────────────────
+# Project scripts – always track
+# ─────────────────────────────────────────────
+!evaluate_metrics.py

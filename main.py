@@ -1,3 +1,4 @@
+import argparse
 import os
 from pathlib import Path
 
@@ -89,6 +90,20 @@ def run_pipeline() -> None:
       4. Save anomalies to data/results/anomalies.csv
       5. Save top-100 suspicious records to data/results/top_suspicious.csv
     """
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument(
+        "--use-saved-model",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use saved multi-dataset model (default: true).",
+    )
+    parser.add_argument(
+        "--model-dir",
+        default="data/models",
+        help="Directory containing combined_rf_model.pkl and feature_aligner.pkl",
+    )
+    args, _unknown = parser.parse_known_args()
+
     # Optional contamination override for the unsupervised path
     contamination = os.environ.get("IF_CONTAMINATION", "auto")
 
@@ -162,15 +177,33 @@ def run_pipeline() -> None:
         anomaly_label = np.where(proba >= threshold, -1, 1)  # IF convention
         anomaly_score = proba
     else:
-        # ── Unsupervised fallback — no labels (real Zeek logs) ──────────
-        print("[+] Using unsupervised Isolation Forest.")
-        if isinstance(contamination, str) and contamination != "auto":
-            contamination = float(contamination)
-        model = train_isolation_forest(
-            features_df,
-            contamination=contamination,
-        )
-        anomaly_score, anomaly_label = score_anomalies(model, features_df)
+        # ── Unsupervised / inference path — no labels (real Zeek logs) ───
+        # If a saved multi-dataset supervised model exists, use it for scoring.
+        model_dir = (project_root / args.model_dir).resolve()
+        combined_model_path = model_dir / "combined_rf_model.pkl"
+        aligner_path = model_dir / "feature_aligner.pkl"
+
+        if args.use_saved_model and combined_model_path.exists() and aligner_path.exists():
+            print(f"[+] Using saved combined model from: {combined_model_path}")
+            import joblib
+
+            from feature_engineering.feature_aligner import FeatureAligner
+
+            model = joblib.load(combined_model_path)
+            aligner = FeatureAligner.load(str(aligner_path))
+            X_aligned = aligner.transform(features_df.fillna(0))
+            proba = model.predict_proba(X_aligned.values)[:, 1]
+            anomaly_score = proba
+            anomaly_label = np.where(proba >= 0.5, -1, 1)
+        else:
+            print("[+] Using unsupervised Isolation Forest.")
+            if isinstance(contamination, str) and contamination != "auto":
+                contamination = float(contamination)
+            model = train_isolation_forest(
+                features_df,
+                contamination=contamination,
+            )
+            anomaly_score, anomaly_label = score_anomalies(model, features_df)
 
     # ------------------------------------------------------------------
     # Build output DataFrames and save

@@ -1,31 +1,25 @@
 """
 evaluate_metrics.py
 ====================
-Evaluate the Isolation Forest anomaly detection model by re-running the full
-pipeline on the existing data and computing supervised metrics where the
-ground-truth 'Label' column is available (CIC-IDS 2017 dataset).
+Evaluate the anomaly-detection model by re-running the full pipeline on
+the existing data and computing metrics.
 
-Metrics computed
-----------------
-Supervised (using ground-truth anomaly label from dataset):
-  - Confusion Matrix  (TP, FP, TN, FN)
-  - Accuracy, Precision, Recall, F1-Score
-  - ROC-AUC, Average Precision (PR-AUC)
-  - Matthews Correlation Coefficient (MCC)
-  - Cohen's Kappa
-  - False Positive Rate (FPR), False Negative Rate (FNR)
+When ground-truth ``Label`` column is present (CIC-IDS datasets):
+  - Supervised Random Forest is trained and evaluated.
+  - 5-fold stratified cross-validation reports mean ± std F1.
+  - A probability threshold sweep (0.10 → 0.90) records F1 at each step.
+  - Top-15 feature importances are printed and saved.
 
-Unsupervised / operational:
-  - Total records processed
-  - Total anomalies detected (anomaly_label == -1)
-  - Anomaly rate (contamination fraction realised)
-  - Anomaly score distribution (mean, std, min, max, percentiles)
-  - Per-attack-type breakdown (recall per class in detected anomalies)
+When no labels are present (raw Zeek logs):
+  - Unsupervised Isolation Forest is used (「contamination='auto'」).
+  - Only operational / unsupervised metrics are reported.
 
-Output
-------
-  data/results/metrics_report.json   – machine-readable
-  data/results/evaluation_report.md  – human-readable markdown report
+Output files
+------------
+  data/results/metrics_report.json       – machine-readable full report
+  data/results/evaluation_report.md      – human-readable Markdown
+  data/results/feature_importance.csv    – top features (supervised only)
+  data/results/threshold_sweep.csv       – threshold vs F1 (supervised only)
 """
 
 import json
@@ -46,10 +40,13 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
+from sklearn.model_selection import StratifiedKFold
 
 from detection.detect_anomalies import build_anomaly_dataframe
+from feature_engineering.derive_features import add_derived_features
 from feature_engineering.extract_features import aggregate_features_from_directory
 from models.isolation_forest import score_anomalies, train_isolation_forest
+from models.random_forest import score_supervised, train_random_forest, tune_threshold
 
 
 # ---------------------------------------------------------------------------
@@ -60,9 +57,74 @@ RAW_DIR = PROJECT_ROOT / "data" / "raw_zeek_logs"
 RESULTS_DIR = PROJECT_ROOT / "data" / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-METRICS_JSON = RESULTS_DIR / "metrics_report.json"
-REPORT_MD = RESULTS_DIR / "evaluation_report.md"
+METRICS_JSON    = RESULTS_DIR / "metrics_report.json"
+REPORT_MD       = RESULTS_DIR / "evaluation_report.md"
+FEAT_IMP_CSV    = RESULTS_DIR / "feature_importance.csv"
+THRESHOLD_CSV   = RESULTS_DIR / "threshold_sweep.csv"
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _binarise(labels_series: pd.Series) -> np.ndarray:
+    """Return 0 = BENIGN, 1 = attack from a raw Label series."""
+    return (
+        labels_series.fillna("BENIGN")
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        .apply(lambda lbl: 0 if lbl == "BENIGN" else 1)
+        .values
+    )
+
+
+def _supervised_metrics(gt_binary, pred_binary, proba) -> dict:
+    """Compute a full suite of supervised classification metrics."""
+    tn, fp, fn, tp = confusion_matrix(gt_binary, pred_binary, labels=[0, 1]).ravel()
+
+    precision   = precision_score(gt_binary, pred_binary, zero_division=0)
+    recall      = recall_score(gt_binary, pred_binary, zero_division=0)
+    f1          = f1_score(gt_binary, pred_binary, zero_division=0)
+    accuracy    = accuracy_score(gt_binary, pred_binary)
+    mcc         = matthews_corrcoef(gt_binary, pred_binary)
+    kappa       = cohen_kappa_score(gt_binary, pred_binary)
+    fpr         = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+    fnr         = fn / (fn + tp) if (fn + tp) > 0 else 0.0
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+
+    try:
+        roc_auc = roc_auc_score(gt_binary, proba)
+    except Exception:
+        roc_auc = None
+
+    try:
+        pr_auc = average_precision_score(gt_binary, proba)
+    except Exception:
+        pr_auc = None
+
+    return {
+        "true_positives":  int(tp),
+        "true_negatives":  int(tn),
+        "false_positives": int(fp),
+        "false_negatives": int(fn),
+        "accuracy":        round(float(accuracy), 6),
+        "precision":       round(float(precision), 6),
+        "recall":          round(float(recall), 6),
+        "f1_score":        round(float(f1), 6),
+        "specificity":     round(float(specificity), 6),
+        "fpr":             round(float(fpr), 6),
+        "fnr":             round(float(fnr), 6),
+        "mcc":             round(float(mcc), 6),
+        "cohen_kappa":     round(float(kappa), 6),
+        "roc_auc":         round(float(roc_auc), 6) if roc_auc is not None else None,
+        "pr_auc":          round(float(pr_auc), 6)  if pr_auc  is not None else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
     print("[+] Loading and extracting features …")
@@ -74,181 +136,289 @@ def main():
         print("[!] No features found – aborting.")
         return
 
-    n_total = len(features_df)
-    n_features = features_df.shape[1]
+    n_total    = len(features_df)
+    n_features_raw = features_df.shape[1]
     print(f"    Records loaded : {n_total:,}")
-    print(f"    Feature count  : {n_features}")
+    print(f"    Feature count  : {n_features_raw}")
+
+    has_labels = "Label" in metadata_df.columns
 
     # -----------------------------------------------------------------------
-    # Train & score
+    # === SUPERVISED PATH ===
     # -----------------------------------------------------------------------
-    print("[+] Training Isolation Forest …")
-    t1 = time.perf_counter()
-    model = train_isolation_forest(features_df)
-    train_time = time.perf_counter() - t1
+    if has_labels:
+        print("[+] Labels found — running supervised evaluation (Random Forest).")
 
-    print("[+] Scoring …")
-    t2 = time.perf_counter()
-    anomaly_score, anomaly_label = score_anomalies(model, features_df)
-    infer_time = time.perf_counter() - t2
+        # Build enriched feature matrix.
+        # Drop features_df columns that duplicate a metadata_df column so
+        # pd.concat never creates duplicate column names (which makes
+        # column indexing return a DataFrame instead of a Series).
+        meta_r = metadata_df.reset_index(drop=True)
+        feats_r = features_df.reset_index(drop=True)
+        _overlap = [c for c in feats_r.columns if c in meta_r.columns]
+        if _overlap:
+            feats_r = feats_r.drop(columns=_overlap)
+        combined = pd.concat([meta_r, feats_r], axis=1)
+        enriched = add_derived_features(combined)
 
-    full_df = build_anomaly_dataframe(metadata_df, anomaly_score, anomaly_label)
+        DROP = {"Label", "timestamp", "source_ip", "destination_ip", "protocol"}
+        feat_cols = [
+            c for c in enriched.columns
+            if c not in DROP and pd.api.types.is_numeric_dtype(enriched[c])
+        ]
+        X = (
+            enriched[feat_cols]
+            .replace([float("inf"), float("-inf")], 0)
+            .fillna(0)
+        )
+        y_raw = metadata_df["Label"].fillna("BENIGN").astype(str)
+        y_bin = _binarise(y_raw)
 
-    # -----------------------------------------------------------------------
-    # Operational / unsupervised metrics
-    # -----------------------------------------------------------------------
-    n_anomaly = int((anomaly_label == -1).sum())
-    n_normal = int((anomaly_label == 1).sum())
-    anomaly_rate = n_anomaly / n_total
+        n_features = X.shape[1]
+        print(f"    Enriched feature count: {n_features}")
 
-    score_stats = {
-        "mean": float(np.mean(anomaly_score)),
-        "std": float(np.std(anomaly_score)),
-        "min": float(np.min(anomaly_score)),
-        "max": float(np.max(anomaly_score)),
-        "p25": float(np.percentile(anomaly_score, 25)),
-        "p50": float(np.percentile(anomaly_score, 50)),
-        "p75": float(np.percentile(anomaly_score, 75)),
-        "p95": float(np.percentile(anomaly_score, 95)),
-        "p99": float(np.percentile(anomaly_score, 99)),
-    }
+        # ── Train (full dataset) ─────────────────────────────────────────
+        print("[+] Training Random Forest …")
+        t1 = time.perf_counter()
+        model_rf, _ = train_random_forest(X, y_raw)
+        train_time = time.perf_counter() - t1
 
-    # -----------------------------------------------------------------------
-    # Supervised metrics  (available because CIC-IDS has a 'Label' column)
-    # -----------------------------------------------------------------------
-    supervised_metrics = None
-    class_breakdown = {}
+        # ── Threshold tuning ─────────────────────────────────────────────
+        print("[+] Tuning decision threshold …")
+        threshold = tune_threshold(model_rf, X, y_raw)
+        print(f"    Optimal threshold: {threshold:.4f}")
 
-    if "Label" in full_df.columns:
-        labels_raw = full_df["Label"].fillna("UNKNOWN").astype(str).str.strip().str.upper()
-        gt_binary = (labels_raw != "BENIGN").astype(int)   # 1 = attack, 0 = benign
-        pred_binary = (full_df["anomaly_label"] == -1).astype(int)  # 1 = anomaly
+        # ── Full-dataset scoring ─────────────────────────────────────────
+        print("[+] Scoring …")
+        t2 = time.perf_counter()
+        proba, _ = score_supervised(model_rf, X)
+        infer_time = time.perf_counter() - t2
 
-        tn, fp, fn, tp = confusion_matrix(gt_binary, pred_binary, labels=[0, 1]).ravel()
+        pred_bin = (proba >= threshold).astype(int)
+        anomaly_label_if = np.where(pred_bin == 1, -1, 1)  # IF convention
 
-        precision   = precision_score(gt_binary, pred_binary, zero_division=0)
-        recall      = recall_score(gt_binary, pred_binary, zero_division=0)
-        f1          = f1_score(gt_binary, pred_binary, zero_division=0)
-        accuracy    = accuracy_score(gt_binary, pred_binary)
-        mcc         = matthews_corrcoef(gt_binary, pred_binary)
-        kappa       = cohen_kappa_score(gt_binary, pred_binary)
-        fpr         = fp / (fp + tn) if (fp + tn) > 0 else 0.0
-        fnr         = fn / (fn + tp) if (fn + tp) > 0 else 0.0
-        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+        # Full Supervised metrics
+        supervised_metrics = _supervised_metrics(y_bin, pred_bin, proba)
 
-        # ROC-AUC & PR-AUC use continuous anomaly score
-        # Higher anomaly_score → more likely anomalous  ✓
-        # Align score ordering with gt_binary (attack=1)
-        try:
-            roc_auc = roc_auc_score(gt_binary, anomaly_score)
-        except Exception:
-            roc_auc = None
+        # ── Threshold sweep ──────────────────────────────────────────────
+        print("[+] Running threshold sweep (0.10 → 0.90) …")
+        sweep_rows = []
+        for thr in np.arange(0.10, 0.91, 0.05):
+            thr = round(float(thr), 2)
+            p_bin = (proba >= thr).astype(int)
+            f1_thr = f1_score(y_bin, p_bin, zero_division=0)
+            prec   = precision_score(y_bin, p_bin, zero_division=0)
+            rec    = recall_score(y_bin, p_bin, zero_division=0)
+            sweep_rows.append({"threshold": thr, "f1": round(f1_thr, 6),
+                                "precision": round(prec, 6), "recall": round(rec, 6)})
+        sweep_df = pd.DataFrame(sweep_rows)
+        sweep_df.to_csv(THRESHOLD_CSV, index=False)
+        print(f"[+] Threshold sweep saved to: {THRESHOLD_CSV}")
 
-        try:
-            pr_auc = average_precision_score(gt_binary, anomaly_score)
-        except Exception:
-            pr_auc = None
+        # ── 5-fold cross-validation ──────────────────────────────────────
+        print("[+] Running 5-fold stratified cross-validation …")
+        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        cv_f1_scores = []
+        for fold, (train_idx, val_idx) in enumerate(skf.split(X, y_bin), 1):
+            X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
+            y_tr_raw    = y_raw.iloc[train_idx]
+            y_val_bin   = y_bin[val_idx]
 
-        supervised_metrics = {
-            "true_positives":  int(tp),
-            "true_negatives":  int(tn),
-            "false_positives": int(fp),
-            "false_negatives": int(fn),
-            "accuracy":        round(accuracy, 6),
-            "precision":       round(precision, 6),
-            "recall":          round(recall, 6),
-            "f1_score":        round(f1, 6),
-            "specificity":     round(specificity, 6),
-            "fpr":             round(fpr, 6),
-            "fnr":             round(fnr, 6),
-            "mcc":             round(mcc, 6),
-            "cohen_kappa":     round(kappa, 6),
-            "roc_auc":         round(roc_auc, 6) if roc_auc is not None else None,
-            "pr_auc":          round(pr_auc, 6)  if pr_auc  is not None else None,
-        }
+            fold_model, _ = train_random_forest(X_tr, y_tr_raw)
+            fold_thr       = tune_threshold(fold_model, X_tr, y_tr_raw)
+            fold_proba, _  = score_supervised(fold_model, X_val)
+            fold_pred      = (fold_proba >= fold_thr).astype(int)
+            fold_f1        = f1_score(y_val_bin, fold_pred, zero_division=0)
+            cv_f1_scores.append(fold_f1)
+            print(f"    Fold {fold}: F1 = {fold_f1:.4f}  (threshold={fold_thr:.4f})")
 
-        # Per-class breakdown
-        all_attack_types = labels_raw.unique().tolist()
-        for attack in sorted(all_attack_types):
-            mask = (labels_raw == attack)
+        cv_mean = float(np.mean(cv_f1_scores))
+        cv_std  = float(np.std(cv_f1_scores))
+        print(f"    CV F1: {cv_mean:.4f} ± {cv_std:.4f}")
+
+        # ── Feature importance ───────────────────────────────────────────
+        print("[+] Extracting feature importances …")
+        importances = model_rf.feature_importances_
+        imp_df = (
+            pd.DataFrame({"feature": feat_cols, "importance": importances})
+            .sort_values("importance", ascending=False)
+            .reset_index(drop=True)
+        )
+        imp_df.to_csv(FEAT_IMP_CSV, index=False)
+        print(f"[+] Feature importance saved to: {FEAT_IMP_CSV}")
+
+        print("\n  Top 15 Features:")
+        for _, row in imp_df.head(15).iterrows():
+            bar = "█" * int(row["importance"] * 400)
+            print(f"    {row['feature']:<45} {row['importance']:.6f}  {bar}")
+
+        # ── Per-class breakdown ──────────────────────────────────────────
+        labels_upper = y_raw.str.strip().str.upper()
+        class_breakdown = {}
+        for attack in sorted(labels_upper.unique()):
+            mask      = (labels_upper == attack).values
             total_cls = int(mask.sum())
-            detected  = int((pred_binary[mask] == 1).sum())
+            detected  = int((pred_bin[mask] == 1).sum())
             class_breakdown[attack] = {
                 "total":    total_cls,
                 "detected": detected,
                 "recall":   round(detected / total_cls, 6) if total_cls > 0 else 0.0,
             }
 
-    # -----------------------------------------------------------------------
-    # Timing
-    # -----------------------------------------------------------------------
-    timing = {
-        "data_load_seconds":      round(load_time, 3),
-        "model_train_seconds":    round(train_time, 3),
-        "inference_seconds":      round(infer_time, 3),
-        "throughput_records_per_second": round(n_total / infer_time, 1) if infer_time > 0 else None,
-    }
+        # Operational stats
+        n_anomaly = int((anomaly_label_if == -1).sum())
+        n_normal  = int((anomaly_label_if == 1).sum())
+        anomaly_rate = n_anomaly / n_total
+
+        # Score stats (on proba)
+        score_stats = {
+            "mean": float(np.mean(proba)),
+            "std":  float(np.std(proba)),
+            "min":  float(np.min(proba)),
+            "max":  float(np.max(proba)),
+            "p25":  float(np.percentile(proba, 25)),
+            "p50":  float(np.percentile(proba, 50)),
+            "p75":  float(np.percentile(proba, 75)),
+            "p95":  float(np.percentile(proba, 95)),
+            "p99":  float(np.percentile(proba, 99)),
+        }
+
+        timing = {
+            "data_load_seconds":              round(load_time, 3),
+            "model_train_seconds":            round(train_time, 3),
+            "inference_seconds":              round(infer_time, 3),
+            "throughput_records_per_second":  round(n_total / infer_time, 1) if infer_time > 0 else None,
+        }
+
+        hyperparams = {
+            "model":         "RandomForestClassifier",
+            "n_estimators":  model_rf.n_estimators,
+            "class_weight":  str(model_rf.class_weight),
+            "n_features":    n_features,
+            "threshold":     round(threshold, 6),
+        }
+
+        report = {
+            "dataset": {
+                "raw_dir":         str(RAW_DIR),
+                "total_records":   n_total,
+                "total_anomalies": n_anomaly,
+                "total_normal":    n_normal,
+                "anomaly_rate":    round(anomaly_rate, 6),
+            },
+            "model_hyperparameters":        hyperparams,
+            "anomaly_score_distribution":   score_stats,
+            "supervised_metrics":           supervised_metrics,
+            "cross_validation": {
+                "folds":     5,
+                "f1_scores": [round(s, 6) for s in cv_f1_scores],
+                "mean_f1":   round(cv_mean, 6),
+                "std_f1":    round(cv_std, 6),
+            },
+            "per_class_breakdown": class_breakdown,
+            "timing":              timing,
+        }
 
     # -----------------------------------------------------------------------
-    # Model hyper-parameters
+    # === UNSUPERVISED PATH ===
     # -----------------------------------------------------------------------
-    hyperparams = {
-        "n_estimators":  model.n_estimators,
-        "contamination": model.contamination,
-        "random_state":  model.random_state,
-        "n_features":    n_features,
-    }
+    else:
+        print("[+] No labels — running unsupervised Isolation Forest evaluation.")
+        n_features = features_df.shape[1]
+
+        print("[+] Training Isolation Forest …")
+        t1 = time.perf_counter()
+        model = train_isolation_forest(features_df, contamination="auto")
+        train_time = time.perf_counter() - t1
+
+        print("[+] Scoring …")
+        t2 = time.perf_counter()
+        anomaly_score, anomaly_label_if = score_anomalies(model, features_df)
+        infer_time = time.perf_counter() - t2
+
+        n_anomaly   = int((anomaly_label_if == -1).sum())
+        n_normal    = int((anomaly_label_if == 1).sum())
+        anomaly_rate = n_anomaly / n_total
+
+        score_stats = {
+            "mean": float(np.mean(anomaly_score)),
+            "std":  float(np.std(anomaly_score)),
+            "min":  float(np.min(anomaly_score)),
+            "max":  float(np.max(anomaly_score)),
+            "p25":  float(np.percentile(anomaly_score, 25)),
+            "p50":  float(np.percentile(anomaly_score, 50)),
+            "p75":  float(np.percentile(anomaly_score, 75)),
+            "p95":  float(np.percentile(anomaly_score, 95)),
+            "p99":  float(np.percentile(anomaly_score, 99)),
+        }
+        timing = {
+            "data_load_seconds":             round(load_time, 3),
+            "model_train_seconds":           round(train_time, 3),
+            "inference_seconds":             round(infer_time, 3),
+            "throughput_records_per_second": round(n_total / infer_time, 1) if infer_time > 0 else None,
+        }
+        hyperparams = {
+            "model":         "IsolationForest",
+            "n_estimators":  model.n_estimators,
+            "contamination": str(model.contamination),
+            "random_state":  model.random_state,
+            "n_features":    n_features,
+        }
+        supervised_metrics = None
+        class_breakdown    = {}
+        proba              = anomaly_score  # for unified printing below
+
+        report = {
+            "dataset": {
+                "raw_dir":         str(RAW_DIR),
+                "total_records":   n_total,
+                "total_anomalies": n_anomaly,
+                "total_normal":    n_normal,
+                "anomaly_rate":    round(anomaly_rate, 6),
+            },
+            "model_hyperparameters":       hyperparams,
+            "anomaly_score_distribution":  score_stats,
+            "supervised_metrics":          None,
+            "cross_validation":            None,
+            "per_class_breakdown":         {},
+            "timing":                      timing,
+        }
 
     # -----------------------------------------------------------------------
-    # Assemble JSON report
+    # Save JSON report
     # -----------------------------------------------------------------------
-    report = {
-        "dataset": {
-            "raw_dir":        str(RAW_DIR),
-            "total_records":  n_total,
-            "total_anomalies": n_anomaly,
-            "total_normal":   n_normal,
-            "anomaly_rate":   round(anomaly_rate, 6),
-        },
-        "model_hyperparameters": hyperparams,
-        "anomaly_score_distribution": score_stats,
-        "supervised_metrics": supervised_metrics,
-        "per_class_breakdown": class_breakdown,
-        "timing": timing,
-    }
-
     with open(METRICS_JSON, "w") as f:
         json.dump(report, f, indent=2)
     print(f"[+] JSON metrics saved to: {METRICS_JSON}")
 
     # -----------------------------------------------------------------------
-    # Markdown report
+    # Build Markdown report
     # -----------------------------------------------------------------------
     lines = []
-    lines.append("# Isolation Forest – Model Evaluation Report\n")
+    lines.append("# Anomaly Detection – Model Evaluation Report\n")
     lines.append(f"*Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}*\n")
-
     lines.append("---\n")
+
     lines.append("## 1. Dataset Summary\n")
-    lines.append(f"| Metric | Value |")
-    lines.append(f"|--------|-------|")
+    lines.append("| Metric | Value |")
+    lines.append("|--------|-------|")
     lines.append(f"| Raw data directory | `{RAW_DIR}` |")
     lines.append(f"| Total records | **{n_total:,}** |")
     lines.append(f"| Records flagged as anomaly | **{n_anomaly:,}** |")
-    lines.append(f"| Records flagged as normal | **{n_normal:,}** |")
-    lines.append(f"| Realised anomaly rate | **{anomaly_rate:.2%}** |")
+    lines.append(f"| Records flagged as normal  | **{n_normal:,}** |")
+    lines.append(f"| Realised anomaly rate | **{n_anomaly/n_total:.2%}** |")
     lines.append("")
 
     lines.append("## 2. Model Hyper-parameters\n")
-    lines.append(f"| Parameter | Value |")
-    lines.append(f"|-----------|-------|")
-    for k, v in hyperparams.items():
+    lines.append("| Parameter | Value |")
+    lines.append("|-----------|-------|")
+    for k, v in report["model_hyperparameters"].items():
         lines.append(f"| {k} | {v} |")
     lines.append("")
 
     lines.append("## 3. Anomaly Score Distribution\n")
-    lines.append(f"| Statistic | Value |")
-    lines.append(f"|-----------|-------|")
+    lines.append("| Statistic | Value |")
+    lines.append("|-----------|-------|")
     for k, v in score_stats.items():
         lines.append(f"| {k} | {v:.6f} |")
     lines.append("")
@@ -269,21 +439,31 @@ def main():
         lines.append("| Metric | Value |")
         lines.append("|--------|-------|")
         metric_rows = [
-            ("Accuracy",                         f"{m['accuracy']:.4f}"),
-            ("Precision (attack class)",          f"{m['precision']:.4f}"),
-            ("Recall / Sensitivity (attack)",     f"{m['recall']:.4f}"),
-            ("F1-Score (attack class)",           f"{m['f1_score']:.4f}"),
-            ("Specificity (benign recall)",       f"{m['specificity']:.4f}"),
-            ("False Positive Rate (FPR)",         f"{m['fpr']:.4f}"),
-            ("False Negative Rate (FNR)",         f"{m['fnr']:.4f}"),
-            ("Matthews Correlation Coefficient",  f"{m['mcc']:.4f}"),
-            ("Cohen's Kappa",                     f"{m['cohen_kappa']:.4f}"),
-            ("ROC-AUC",                           f"{m['roc_auc']:.4f}" if m['roc_auc'] is not None else "N/A"),
-            ("PR-AUC (Avg. Precision)",           f"{m['pr_auc']:.4f}"  if m['pr_auc']  is not None else "N/A"),
+            ("Accuracy",                        f"{m['accuracy']:.4f}"),
+            ("Precision (attack class)",         f"{m['precision']:.4f}"),
+            ("Recall / Sensitivity (attack)",    f"{m['recall']:.4f}"),
+            ("F1-Score (attack class)",          f"{m['f1_score']:.4f}"),
+            ("Specificity (benign recall)",      f"{m['specificity']:.4f}"),
+            ("False Positive Rate (FPR)",        f"{m['fpr']:.4f}"),
+            ("False Negative Rate (FNR)",        f"{m['fnr']:.4f}"),
+            ("Matthews Correlation Coefficient", f"{m['mcc']:.4f}"),
+            ("Cohen's Kappa",                    f"{m['cohen_kappa']:.4f}"),
+            ("ROC-AUC",  f"{m['roc_auc']:.4f}" if m["roc_auc"] is not None else "N/A"),
+            ("PR-AUC",   f"{m['pr_auc']:.4f}"  if m["pr_auc"]  is not None else "N/A"),
         ]
         for row_name, row_val in metric_rows:
             lines.append(f"| {row_name} | **{row_val}** |")
         lines.append("")
+
+        if "cross_validation" in report and report["cross_validation"]:
+            cv = report["cross_validation"]
+            lines.append("### 4c. 5-Fold Cross-Validation F1\n")
+            lines.append("| Fold | F1 |")
+            lines.append("|------|----|")
+            for i, s in enumerate(cv["f1_scores"], 1):
+                lines.append(f"| {i} | {s:.4f} |")
+            lines.append(f"| **Mean** | **{cv['mean_f1']:.4f} ± {cv['std_f1']:.4f}** |")
+            lines.append("")
 
     if class_breakdown:
         lines.append("## 5. Per-Attack-Type Breakdown\n")
@@ -301,7 +481,7 @@ def main():
     lines.append(f"| Data loading time | {timing['data_load_seconds']:.2f} s |")
     lines.append(f"| Model training time | {timing['model_train_seconds']:.2f} s |")
     lines.append(f"| Inference time | {timing['inference_seconds']:.2f} s |")
-    if timing['throughput_records_per_second']:
+    if timing.get("throughput_records_per_second"):
         lines.append(f"| Throughput | {timing['throughput_records_per_second']:,.1f} records/s |")
     lines.append("")
 
@@ -317,20 +497,21 @@ def main():
             f"- It raised **{m['false_positives']:,} false alarms** on benign traffic "
             f"(FPR = {m['fpr']:.2%})."
         )
-        if m['roc_auc'] is not None:
+        if m["roc_auc"] is not None:
+            disc = "strong" if m["roc_auc"] >= 0.80 else "moderate" if m["roc_auc"] >= 0.65 else "weak"
             lines.append(
-                f"- ROC-AUC of **{m['roc_auc']:.4f}** indicates "
-                + ("strong" if m['roc_auc'] >= 0.80 else "moderate" if m['roc_auc'] >= 0.65 else "weak")
-                + " discrimination ability between normal and attack traffic."
+                f"- ROC-AUC of **{m['roc_auc']:.4f}** indicates {disc} "
+                "discrimination ability between normal and attack traffic."
             )
         lines.append(
-            "- Isolation Forest is an *unsupervised* method trained without labels; "
-            "performance is sensitive to the `contamination` hyper-parameter (currently "
-            f"`{model.contamination}`)."
+            "- Random Forest (supervised) is used because ground-truth labels are available. "
+            "For unlabelled real Zeek logs the pipeline falls back to Isolation Forest."
         )
+    else:
         lines.append(
-            "- Consider tuning `contamination` to the known attack ratio in your deployment "
-            "environment to balance precision vs. recall."
+            "- **Unsupervised Isolation Forest** was used (no Label column found). "
+            "For datasets with labels (CIC-IDS, NSL-KDD, UNSW-NB15) the pipeline "
+            "automatically switches to the supervised Random Forest path."
         )
 
     report_text = "\n".join(lines)
@@ -344,8 +525,9 @@ def main():
     print("\n" + "=" * 60)
     print("           EVALUATION SUMMARY")
     print("=" * 60)
+    print(f"  Model            : {report['model_hyperparameters']['model']}")
     print(f"  Total records    : {n_total:,}")
-    print(f"  Anomalies found  : {n_anomaly:,}  ({anomaly_rate:.2%})")
+    print(f"  Anomalies found  : {n_anomaly:,}  ({n_anomaly/n_total:.2%})")
     if supervised_metrics:
         m = supervised_metrics
         print(f"  Accuracy         : {m['accuracy']:.4f}")
@@ -357,6 +539,9 @@ def main():
         print(f"  MCC              : {m['mcc']:.4f}")
         print(f"  FPR              : {m['fpr']:.4f}")
         print(f"  FNR              : {m['fnr']:.4f}")
+        if "cross_validation" in report and report["cross_validation"]:
+            cv = report["cross_validation"]
+            print(f"  CV F1 (5-fold)   : {cv['mean_f1']:.4f} ± {cv['std_f1']:.4f}")
     print("=" * 60)
 
 

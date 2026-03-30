@@ -50,6 +50,8 @@ def load_zeek_log(path: str) -> pd.DataFrame:
 
     - Supports raw Zeek .log files with '#fields' header.
     - Supports CSV/TSV files with standard headers.
+    - Tries UTF-8 first, then falls back to latin-1 / Windows-1252 for
+      CIC-IDS style CSVs that contain non-UTF-8 byte sequences.
     """
     if not os.path.exists(path):
         raise FileNotFoundError(f"Zeek log not found: {path}")
@@ -58,12 +60,43 @@ def load_zeek_log(path: str) -> pd.DataFrame:
     if ext == ".log":
         df = _parse_zeek_tsv(path)
     else:
-        df = pd.read_csv(
-            path,
-            sep=None,
-            engine="python",
-            na_values=["-"],
-        )
+        for enc in ("utf-8", "latin-1", "cp1252"):
+            try:
+                df = pd.read_csv(
+                    path,
+                    sep=",",
+                    engine="c",
+                    na_values=["-"],
+                    encoding=enc,
+                    low_memory=False,
+                )
+                break  # succeeded
+            except UnicodeDecodeError:
+                continue
+            except Exception:
+                # If comma sep fails (e.g. TSV), fall back to python engine
+                try:
+                    df = pd.read_csv(
+                        path,
+                        sep=None,
+                        engine="python",
+                        na_values=["-"],
+                        encoding=enc,
+                    )
+                    break
+                except UnicodeDecodeError:
+                    continue
+        else:
+            # Last-resort: ignore undecodable bytes
+            df = pd.read_csv(
+                path,
+                sep=",",
+                engine="c",
+                na_values=["-"],
+                encoding="utf-8",
+                encoding_errors="ignore",
+                low_memory=False,
+            )
 
     # Strip whitespace from column names to better match known fields
     df.columns = [str(c).strip() for c in df.columns]

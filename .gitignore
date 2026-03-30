@@ -42,15 +42,10 @@ venv.bak/
 # Data files (large / raw datasets)
 # ─────────────────────────────────────────────
 data/raw_zeek_logs/
-data/results/anomalies.csv
-data/results/metrics_report.json
-data/results/evaluation_report.md
+data/results/
 *.pcap
 *.pcapng
 *.log
-
-# Keep small result summaries
-!data/results/top_suspicious.csv
 
 # General large data formats
 *.parquet
@@ -114,7 +109,6 @@ config_local.py
 # Misc
 # ─────────────────────────────────────────────
 *.csv
-!data/results/top_suspicious.csv
 *.tmp
 *.bak
 .cache/

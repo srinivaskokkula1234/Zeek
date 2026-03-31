@@ -24,6 +24,7 @@ A production-grade, end-to-end machine learning pipeline for **network intrusion
 - [Supported Datasets](#supported-datasets)
 - [Output Files](#output-files)
 - [Configuration](#configuration)
+- [Model Performance](#model-performance)
 - [Requirements](#requirements)
 
 ---
@@ -370,6 +371,50 @@ The pipeline auto-discovers and adapts the following benchmark datasets when pla
 | `--strategy` | `combined` | Training strategy (`combined`, `per_dataset`, `cross_eval`) |
 | `--sample-frac` | `1.0` | Fraction of each dataset to use (0 < frac ≤ 1) |
 | `--verbose` | `false` | Enable verbose output |
+
+---
+
+## Model Performance
+
+### Supervised Mode — Random Forest (CIC-IDS 2017)
+
+Evaluated on **2,933,727 records** (2,376,081 benign · 557,646 attack) via `data/results/model_metrics.json`.
+
+| Metric | Value |
+|---|---|
+| Accuracy | **0.999492** |
+| Precision | **0.997604** |
+| Recall | **0.999731** |
+| F1-Score | **0.998666** |
+| ROC-AUC | **0.999997** |
+| PR-AUC | **0.999987** |
+
+Near-perfect discrimination across all metrics. The extremely high ROC-AUC and PR-AUC confirm that the model cleanly separates benign from attack traffic even under significant class imbalance (~19% attack rate). The precision/recall balance shows virtually no missed attacks (FNR ≈ 0.03%) and negligible false alarms.
+
+### Unsupervised Mode — Isolation Forest
+
+Evaluated via `data/results/metrics_report.json` against the same CIC-IDS ground truth, but with no label information used during training.
+
+| Metric | Value |
+|---|---|
+| Accuracy | 0.761109 |
+| Precision | 0.362936 |
+| Recall | 0.080587 |
+| F1-Score | 0.131889 |
+| ROC-AUC | 0.519837 |
+| PR-AUC | 0.234887 |
+
+Performance is substantially lower than the supervised path, which is expected — Isolation Forest has no access to ground truth during training. ROC-AUC near 0.52 indicates the model is only marginally better than random at ranking anomalies. Use this mode only when labels or a pre-trained supervised model are unavailable (e.g., live Zeek traffic); otherwise, the supervised or inference path will yield far higher accuracy.
+
+### Multi-Dataset Training
+
+Results from `data/models/multi_dataset_metrics.json` are pending. The `train_multi.py` run encountered an OOM error during feature alignment, which has been resolved by updating `FeatureAligner.transform()` to use `reindex(..., fill_value=0)` with `float32` casting. Re-run with a reduced sample fraction to stay within memory limits:
+
+```bash
+python train_multi.py --strategy combined --sample-frac 0.2 --verbose
+```
+
+Multi-dataset metrics will be added here once the run completes.
 
 ---
 

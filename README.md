@@ -46,49 +46,8 @@ A production-grade, end-to-end machine learning pipeline for **network intrusion
 ---
 
 ## Architecture Overview
+<img width="617" height="856" alt="image" src="https://github.com/user-attachments/assets/0e7372fa-85c4-4ae8-b6c8-d3738a702c8b" />
 
-```
-                    ┌──────────────────────────┐
-                    │   Raw Zeek Logs / CSVs   │
-                    │   (data/raw_zeek_logs/)   │
-                    └────────────┬─────────────┘
-                                 │
-                    ┌────────────▼─────────────┐
-                    │   Data Ingestion Layer    │
-                    │  • Zeek TSV parser        │
-                    │  • CSV auto-detect        │
-                    │  • Dataset adapters       │
-                    └────────────┬─────────────┘
-                                 │
-                    ┌────────────▼─────────────┐
-                    │   Feature Engineering     │
-                    │  • Protocol-specific      │
-                    │  • Derived features       │
-                    │  • Feature alignment      │
-                    └────────────┬─────────────┘
-                                 │
-                ┌────────────────┼────────────────┐
-                │                │                │
-     ┌──────────▼──┐   ┌────────▼─────┐  ┌───────▼────────┐
-     │ Supervised   │   │ Unsupervised │  │   Inference    │
-     │ Random Forest│   │  Isolation   │  │  (Saved Model) │
-     │ / XGBoost    │   │   Forest     │  │                │
-     └──────────┬───┘   └────────┬─────┘  └───────┬────────┘
-                │                │                │
-                └────────────────┼────────────────┘
-                                 │
-                    ┌────────────▼─────────────┐
-                    │   Anomaly Scoring &       │
-                    │   Threshold Tuning        │
-                    └────────────┬─────────────┘
-                                 │
-                    ┌────────────▼─────────────┐
-                    │   Results & Evaluation    │
-                    │  • anomalies.csv          │
-                    │  • metrics_report.json    │
-                    │  • evaluation_report.md   │
-                    └──────────────────────────┘
-```
 
 ---
 

@@ -187,14 +187,17 @@ def _https_specific(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def extract_protocol_features(
-    log_path: str, protocol: str
+    log_path: str, protocol: str, max_rows: int | None = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Load a single Zeek log and extract:
       - metadata (timestamp/source_ip/destination_ip/protocol)
       - numeric feature matrix for the chosen protocol
+
+    If *max_rows* is provided, only that many rows are read from
+    the file to limit memory usage.
     """
-    df = load_zeek_log(log_path)
+    df = load_zeek_log(log_path, max_rows=max_rows)
     protocol_upper = protocol.upper()
 
     if protocol_upper == "GENERIC":
@@ -268,36 +271,104 @@ def aggregate_features_from_directory(
       - 'http'  in filename -> HTTP log
       - 'dns'   in filename -> DNS log
       - 'ssl' or 'https' in filename -> HTTPS log
+
+    Memory management
+    -----------------
+    - ``FEATURE_MAX_ROWS`` env-var (default **200 000**) caps the total
+      number of rows kept across *all* files.  Set to ``0`` or empty to
+      disable the limit (not recommended on machines with < 32 GB RAM).
+    - A **per-file row budget** is computed so that each file reads only
+      ``max_total_rows / n_files`` rows at the I/O level — this avoids
+      loading a multi-GB CSV entirely into memory before sampling.
     """
+    import gc
+
     all_metadata: List[pd.DataFrame] = []
     all_features: List[pd.DataFrame] = []
 
-    # Walk the directory tree so we can handle datasets inside
-    # nested folders (e.g., CIC-IDS, CTU-13).
+    # Memory guardrail -------------------------------------------------
+    max_rows_env = os.environ.get("FEATURE_MAX_ROWS", "200000").strip()
+    max_total_rows = int(max_rows_env) if max_rows_env not in {"", "0"} else None
+    rows_kept = 0
+
+    # ------------------------------------------------------------------
+    # 1. Inventory pass — collect (path, protocol) pairs first so we can
+    #    compute a fair per-file row budget.
+    # ------------------------------------------------------------------
+    file_list: List[Tuple[str, str]] = []
+
     for root, _dirs, files in os.walk(raw_dir):
         for entry in sorted(files):
             path = os.path.join(root, entry)
-
             lower = entry.lower()
             _, ext = os.path.splitext(lower)
 
-            # Accept generic CSV / LOG / TSV files even if they don't
-            # contain protocol keywords in the filename.
+            # Skip metadata / hidden files
+            if lower.startswith(("_", ".")):
+                continue
+
             if "http" in lower and "https" not in lower:
                 protocol = "HTTP"
             elif "dns" in lower:
                 protocol = "DNS"
             elif "https" in lower or "ssl" in lower:
                 protocol = "HTTPS"
-            elif ext in {".csv", ".log", ".tsv"}:
+            elif ext in {".csv", ".log", ".tsv", ".parquet"}:
                 protocol = "GENERIC"
             else:
-                # Unsupported or non-data file
                 continue
 
-            metadata, feats = extract_protocol_features(path, protocol)
-            all_metadata.append(metadata)
-            all_features.append(feats)
+            file_list.append((path, protocol))
+
+    if not file_list:
+        return (
+            pd.DataFrame(columns=["timestamp", "source_ip", "destination_ip", "protocol"]),
+            pd.DataFrame(),
+            FeatureEncoder(),
+        )
+
+    # Per-file row budget so no single file monopolises the limit.
+    n_files = len(file_list)
+    per_file_budget = (
+        max(1000, max_total_rows // n_files) if max_total_rows is not None else None
+    )
+
+    # ------------------------------------------------------------------
+    # 2. Load + extract features per file
+    # ------------------------------------------------------------------
+    for path, protocol in file_list:
+        if max_total_rows is not None and rows_kept >= max_total_rows:
+            break
+
+        # Compute how many rows this file may still contribute.
+        remaining = (max_total_rows - rows_kept) if max_total_rows is not None else None
+        file_max_rows = (
+            min(per_file_budget, remaining) if remaining is not None and per_file_budget is not None else remaining
+        )
+
+        metadata, feats = extract_protocol_features(path, protocol, max_rows=file_max_rows)
+
+        # If the file returned more rows than the remaining budget
+        # (possible when max_rows couldn't be passed through, e.g.
+        # parquet), sample down.
+        if remaining is not None and len(feats) > remaining:
+            keep_idx = feats.sample(n=remaining, random_state=42).index
+            feats = feats.loc[keep_idx]
+            metadata = metadata.loc[keep_idx]
+
+        # Memory safety: keep numeric features in float32 early.
+        if not feats.empty:
+            num_cols = feats.select_dtypes(include=["number"]).columns
+            if len(num_cols) > 0:
+                feats[num_cols] = feats[num_cols].astype(np.float32, copy=False)
+
+        all_metadata.append(metadata)
+        all_features.append(feats)
+        rows_kept += len(feats)
+        print(f"    • {os.path.basename(path)}: {len(feats):,} rows  (total so far: {rows_kept:,})")
+
+        # Free transient memory after each file.
+        gc.collect()
 
     if not all_features:
         return (
@@ -306,8 +377,26 @@ def aggregate_features_from_directory(
             FeatureEncoder(),
         )
 
-    metadata_df = pd.concat(all_metadata, axis=0).reset_index(drop=True)
-    features_df = pd.concat(all_features, axis=0).reset_index(drop=True)
+    # ------------------------------------------------------------------
+    # 3. Unify column schemas before concat to prevent column explosion
+    #    when different CSV datasets have different column names.
+    # ------------------------------------------------------------------
+    all_columns = set()
+    for df in all_features:
+        all_columns.update(df.columns)
+    all_columns = sorted(all_columns)
+
+    # Use reindex (vectorised) instead of per-column assignment to avoid
+    # PerformanceWarning from DataFrame fragmentation.
+    for i, df in enumerate(all_features):
+        all_features[i] = df.reindex(columns=all_columns, fill_value=np.float32(0))
+
+    metadata_df = pd.concat(all_metadata, axis=0, ignore_index=True, sort=False, copy=False)
+    features_df = pd.concat(all_features, axis=0, ignore_index=True, sort=False, copy=False)
+
+    # Release chunk lists immediately
+    del all_metadata, all_features
+    gc.collect()
 
     # Categorical columns to encode
     categorical_cols = [
@@ -324,5 +413,12 @@ def aggregate_features_from_directory(
     # Replace any remaining NaNs with zeros for model consumption
     features_df = features_df.fillna(0)
 
+    # Final compacting pass to avoid unexpectedly promoted float64 columns
+    # after concat/alignment.
+    num_cols = features_df.select_dtypes(include=["number"]).columns
+    if len(num_cols) > 0:
+        features_df[num_cols] = features_df[num_cols].astype(np.float32, copy=False)
+
+    print(f"[+] Aggregated {len(features_df):,} rows × {features_df.shape[1]} features")
     return metadata_df, features_df, encoder
 

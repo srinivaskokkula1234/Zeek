@@ -34,7 +34,7 @@ from tqdm import tqdm
 from feature_engineering.derive_features import add_derived_features
 from feature_engineering.feature_aligner import FeatureAligner
 from feature_engineering.extract_features import aggregate_features_from_directory
-from utils.dataset_adapters import adapt_cicids2018, adapt_nslkdd, adapt_unswnb15
+from utils.dataset_adapters import adapt_cicids2018, adapt_ctu13, adapt_nslkdd, adapt_unswnb15
 from utils.dataset_registry import discover_datasets
 
 
@@ -143,6 +143,8 @@ def _load_dataset(descriptor: Dict, sample_frac: float, verbose: bool) -> Tuple[
         return adapt_nslkdd(paths["train"], paths["test"], sample_frac=sample_frac)
     if dtype == "unswnb15":
         return adapt_unswnb15(paths["train"], paths["test"], sample_frac=sample_frac)
+    if dtype == "ctu13":
+        return adapt_ctu13(paths["directory"], sample_frac=sample_frac)
     if dtype == "cicids2017":
         # Use existing generic CIC-IDS 2017 handling by reading directory as raw logs
         metadata, feats, _ = aggregate_features_from_directory(paths["directory"])
@@ -207,6 +209,13 @@ def train_on_all_datasets(
         seen_keys.add(key)
         keep.append(d)
     discovered = keep
+
+    # For this pipeline run we intentionally train only on the four
+    # supervised datasets requested in the assignment.
+    target_types = {"cicids2018", "ctu13", "nslkdd", "unswnb15"}
+    discovered = [d for d in discovered if d.get("type") in target_types]
+    if not discovered:
+        raise ValueError(f"No target datasets found under raw_dir={raw_dir!r}.")
 
     if strategy not in {"combined", "per_dataset", "cross_eval"}:
         raise ValueError("strategy must be one of: combined, per_dataset, cross_eval")

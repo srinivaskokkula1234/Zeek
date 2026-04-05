@@ -19,7 +19,7 @@ from typing import Callable, Dict, List, Optional
 
 import pandas as pd
 
-from utils.dataset_adapters import adapt_cicids2018, adapt_nslkdd, adapt_unswnb15
+from utils.dataset_adapters import adapt_cicids2018, adapt_ctu13, adapt_nslkdd, adapt_unswnb15
 
 
 def _peek_csv_columns(path: str, nrows: int = 5) -> List[str]:
@@ -136,6 +136,33 @@ def discover_datasets(raw_dir: str) -> List[Dict]:
             continue
 
         # ------------------------------------------------------------
+        # Heuristic: CTU-13
+        # ------------------------------------------------------------
+        # Repo layout may contain CTU-13 as either CSV or parquet
+        # (e.g. *.binetflow.parquet). We register based on the directory
+        # name containing "ctu" and the presence of at least one data file.
+        if "ctu" in os.path.basename(cand).lower() or "ctu" in cand.lower():
+            has_ctu_file = False
+            for root, _dirs, files in os.walk(cand):
+                for fn in files:
+                    if fn.lower().endswith((".csv", ".parquet")):
+                        has_ctu_file = True
+                        break
+                if has_ctu_file:
+                    break
+
+            if has_ctu_file:
+                datasets.append(
+                    {
+                        "name": "CTU-13",
+                        "type": "ctu13",
+                        "paths": {"directory": cand},
+                        "adapter": adapt_ctu13,
+                    }
+                )
+                continue
+
+        # ------------------------------------------------------------
         # Heuristic: CIC-IDS 2018
         # ------------------------------------------------------------
         first_csv = _find_first_csv(cand)
@@ -173,6 +200,13 @@ def discover_datasets(raw_dir: str) -> List[Dict]:
         # ------------------------------------------------------------
         # Fallback: generic
         # ------------------------------------------------------------
+        first_csv = _find_first_csv(cand)
+        if first_csv:
+            cols = _peek_csv_columns(first_csv)
+            if "Label" not in set(cols) and "label" not in set(cols):
+                # Avoid registering large unlabeled directories (e.g. raw DNS logs).
+                continue
+
         datasets.append(
             {
                 "name": os.path.basename(cand) or "generic",

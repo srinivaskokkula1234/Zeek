@@ -4,7 +4,7 @@ from typing import Tuple
 import pandas as pd
 
 
-def _parse_zeek_tsv(path: str) -> pd.DataFrame:
+def _parse_zeek_tsv(path: str, max_rows: int | None = None) -> pd.DataFrame:
     """
     Parse a raw Zeek .log file (tab-separated with #fields header)
     into a pandas DataFrame with proper column names.
@@ -31,6 +31,7 @@ def _parse_zeek_tsv(path: str) -> pd.DataFrame:
             header=None,
             names=field_names,
             na_values=["-"],
+            nrows=max_rows,
         )
     else:
         # Assume a regular CSV/TSV with a header row
@@ -39,12 +40,13 @@ def _parse_zeek_tsv(path: str) -> pd.DataFrame:
             sep=None,
             engine="python",
             na_values=["-"],
+            nrows=max_rows,
         )
 
     return df
 
 
-def load_zeek_log(path: str) -> pd.DataFrame:
+def load_zeek_log(path: str, max_rows: int | None = None) -> pd.DataFrame:
     """
     Load a Zeek log (http/dns/ssl/conn, .log or .csv) into a DataFrame.
 
@@ -52,13 +54,19 @@ def load_zeek_log(path: str) -> pd.DataFrame:
     - Supports CSV/TSV files with standard headers.
     - Tries UTF-8 first, then falls back to latin-1 / Windows-1252 for
       CIC-IDS style CSVs that contain non-UTF-8 byte sequences.
+    - If *max_rows* is given, at most that many data rows are read from
+      disk (avoids loading multi-GB files entirely into RAM).
     """
     if not os.path.exists(path):
         raise FileNotFoundError(f"Zeek log not found: {path}")
 
     ext = os.path.splitext(path)[1].lower()
-    if ext == ".log":
-        df = _parse_zeek_tsv(path)
+    if ext == ".parquet":
+        df = pd.read_parquet(path)
+        if max_rows is not None and len(df) > max_rows:
+            df = df.head(max_rows)
+    elif ext == ".log":
+        df = _parse_zeek_tsv(path, max_rows=max_rows)
     else:
         for enc in ("utf-8", "latin-1", "cp1252"):
             try:
@@ -69,6 +77,7 @@ def load_zeek_log(path: str) -> pd.DataFrame:
                     na_values=["-"],
                     encoding=enc,
                     low_memory=False,
+                    nrows=max_rows,
                 )
                 break  # succeeded
             except UnicodeDecodeError:
@@ -82,6 +91,7 @@ def load_zeek_log(path: str) -> pd.DataFrame:
                         engine="python",
                         na_values=["-"],
                         encoding=enc,
+                        nrows=max_rows,
                     )
                     break
                 except UnicodeDecodeError:
@@ -96,6 +106,7 @@ def load_zeek_log(path: str) -> pd.DataFrame:
                 encoding="utf-8",
                 encoding_errors="ignore",
                 low_memory=False,
+                nrows=max_rows,
             )
 
     # Strip whitespace from column names to better match known fields

@@ -335,45 +335,79 @@ The pipeline auto-discovers and adapts the following benchmark datasets when pla
 
 ## Model Performance
 
-### Supervised Mode — Random Forest (CIC-IDS 2017)
+### Training Configuration
 
-Evaluated on **2,933,727 records** (2,376,081 benign · 557,646 attack) via `data/results/model_metrics.json`.
+A unified **Random Forest** classifier was trained across **all 5 datasets** simultaneously using `train_all_datasets.py`:
+
+| Parameter | Value |
+|---|---|
+| Model | `RandomForestClassifier` |
+| Trees | 200 |
+| Class weight | `balanced` |
+| Total records | **680,000** (20K sampled per file) |
+| Features | 329 (aligned across datasets) |
+| Train / Test split | 80 / 20 stratified |
+| Decision threshold | 0.55 (optimised for F1) |
+| Cross-validation | 3-fold stratified |
+
+---
+
+### Global Metrics (20% Held-Out Test Set)
 
 | Metric | Value |
 |---|---|
-| Accuracy | **0.999492** |
-| Precision | **0.997604** |
-| Recall | **0.999731** |
-| F1-Score | **0.998666** |
-| ROC-AUC | **0.999997** |
-| PR-AUC | **0.999987** |
+| **Accuracy** | **0.9977** |
+| **Precision** | **0.9953** |
+| **Recall** | **0.9961** |
+| **F1-Score** | **0.9957** |
+| **ROC-AUC** | **0.9999** |
+| **PR-AUC** | **0.9999** |
+| MCC | 0.9941 |
+| Cohen's Kappa | 0.9941 |
+| FPR | 0.0017 |
+| FNR | 0.0039 |
+| TP / TN / FP / FN | 35,873 / 99,817 / 168 / 142 |
 
-Near-perfect discrimination across all metrics. The extremely high ROC-AUC and PR-AUC confirm that the model cleanly separates benign from attack traffic even under significant class imbalance (~19% attack rate). The precision/recall balance shows virtually no missed attacks (FNR ≈ 0.03%) and negligible false alarms.
+---
+
+### Per-Dataset Metrics
+
+| Dataset | F1-Score | ROC-AUC | Precision | Recall | FPR | Test Records |
+|---|---|---|---|---|---|---|
+| **CIC-IDS 2017** | **0.9985** | 0.9999 | 1.0000 | 0.9969 | 0.0000 | 24,220 |
+| **CIC-IDS 2018** | **0.9994** | 1.0000 | 0.9996 | 0.9992 | 0.0009 | 32,097 |
+| **UNSW-NB15** | **0.9928** | 0.9999 | 0.9899 | 0.9957 | 0.0040 | 19,885 |
+| **NSL-KDD** | **0.9888** | 0.9995 | 0.9908 | 0.9869 | 0.0100 | 7,911 |
+| **CTU-13** | **0.9811** | 0.9999 | 0.9877 | 0.9746 | 0.0002 | 51,887 |
+
+---
+
+### 3-Fold Cross-Validation
+
+| Fold | F1-Score | ROC-AUC |
+|---|---|---|
+| 1 | 0.9954 | 0.9999 |
+| 2 | 0.9952 | 0.9999 |
+| 3 | 0.9951 | 0.9999 |
+| **Mean ± Std** | **0.9952 ± 0.0001** | **0.9999** |
+
+The extremely low standard deviation (0.0001) across folds confirms the model generalises robustly across all five heterogeneous datasets.
+
+---
 
 ### Unsupervised Mode — Isolation Forest
 
-Evaluated via `data/results/metrics_report.json` against the same CIC-IDS ground truth, but with no label information used during training.
+Evaluated against CIC-IDS ground truth with no label information used during training:
 
 | Metric | Value |
 |---|---|
-| Accuracy | 0.761109 |
-| Precision | 0.362936 |
-| Recall | 0.080587 |
-| F1-Score | 0.131889 |
-| ROC-AUC | 0.519837 |
-| PR-AUC | 0.234887 |
+| Accuracy | 0.7611 |
+| Precision | 0.3629 |
+| Recall | 0.0806 |
+| F1-Score | 0.1319 |
+| ROC-AUC | 0.5198 |
 
-Performance is substantially lower than the supervised path, which is expected — Isolation Forest has no access to ground truth during training. ROC-AUC near 0.52 indicates the model is only marginally better than random at ranking anomalies. Use this mode only when labels or a pre-trained supervised model are unavailable (e.g., live Zeek traffic); otherwise, the supervised or inference path will yield far higher accuracy.
-
-### Multi-Dataset Training
-
-Results from `data/models/multi_dataset_metrics.json` are pending. The `train_multi.py` run encountered an OOM error during feature alignment, which has been resolved by updating `FeatureAligner.transform()` to use `reindex(..., fill_value=0)` with `float32` casting. Re-run with a reduced sample fraction to stay within memory limits:
-
-```bash
-python train_multi.py --strategy combined --sample-frac 0.2 --verbose
-```
-
-Multi-dataset metrics will be added here once the run completes.
+Performance is substantially lower than the supervised path, which is expected — Isolation Forest has no access to ground truth during training. Use this mode only when labels or a pre-trained model are unavailable (e.g., live Zeek traffic).
 
 ---
 

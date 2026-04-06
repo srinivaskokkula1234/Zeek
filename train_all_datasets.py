@@ -109,11 +109,15 @@ def _normalise_ctu_label(raw: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # Generic helpers
 # ─────────────────────────────────────────────────────────────────────────────
-def _read_csv_robust(path: Path) -> Optional[pd.DataFrame]:
-    """Try multiple encodings; return None on failure."""
+def _read_csv_robust(path: Path, nrows: int | None = None) -> Optional[pd.DataFrame]:
+    """Try multiple encodings; return None on failure.
+
+    If *nrows* is given, read at most that many rows from disk to avoid
+    loading multi-GB files entirely into memory.
+    """
     for enc in ("utf-8", "latin-1", "cp1252"):
         try:
-            df = pd.read_csv(path, encoding=enc, low_memory=False)
+            df = pd.read_csv(path, encoding=enc, low_memory=False, nrows=nrows)
             return df
         except UnicodeDecodeError:
             continue
@@ -181,6 +185,9 @@ def _engineer_and_pick_features(df: pd.DataFrame, label_col: str) -> tuple[pd.Da
     # Drop duplicate header rows (CIC-IDS quirk)
     if label_col in df.columns:
         df = df[df[label_col].astype(str) != label_col]
+    # Convert any Categorical columns to plain numeric before fillna
+    for col in df.select_dtypes(include=["category"]).columns:
+        df[col] = df[col].cat.codes
     df = df.replace([np.inf, -np.inf], 0).fillna(0)
 
     y_raw = df[label_col].fillna("BENIGN").astype(str).str.strip() if label_col in df.columns else pd.Series(["BENIGN"] * len(df))
@@ -195,6 +202,9 @@ def _engineer_and_pick_features(df: pd.DataFrame, label_col: str) -> tuple[pd.Da
     # Derived features (silently skips missing source columns)
     enriched = add_derived_features(df)
     feat_cols_e = [c for c in enriched.columns if c not in drop and pd.api.types.is_numeric_dtype(enriched[c])]
+    # Convert any Categorical columns before fillna
+    for col in enriched.select_dtypes(include=["category"]).columns:
+        enriched[col] = enriched[col].cat.codes
     X = enriched[feat_cols_e].replace([np.inf, -np.inf], 0).fillna(0)
     return X, y_raw.reset_index(drop=True)
 
@@ -214,7 +224,7 @@ def load_cic_ids(directory: Path, dataset_name: str, max_rows: int) -> list[dict
     for fpath in csv_files:
         size_mb = fpath.stat().st_size / 1e6
         print(f"  → {fpath.name}  ({size_mb:.0f} MB) …", end="", flush=True)
-        df = _read_csv_robust(fpath)
+        df = _read_csv_robust(fpath, nrows=max_rows * 3)
         if df is None:
             continue
         df.columns = [str(c).strip() for c in df.columns]
@@ -271,7 +281,7 @@ def load_unsw_nb15(directory: Path, max_rows: int) -> list[dict]:
             continue
         size_mb = fpath.stat().st_size / 1e6
         print(f"  → {fname}  ({size_mb:.0f} MB) …", end="", flush=True)
-        df = _read_csv_robust(fpath)
+        df = _read_csv_robust(fpath, nrows=max_rows * 3)
         if df is None:
             continue
         df.columns = [str(c).strip() for c in df.columns]
@@ -308,7 +318,7 @@ def load_unsw_nb15(directory: Path, max_rows: int) -> list[dict]:
             continue
         size_mb = fpath.stat().st_size / 1e6
         print(f"  → {fpath.name}  ({size_mb:.0f} MB) …", end="", flush=True)
-        df = _read_csv_robust(fpath)
+        df = _read_csv_robust(fpath, nrows=max_rows * 3)
         if df is None:
             continue
         df.columns = [str(c).strip() for c in df.columns]

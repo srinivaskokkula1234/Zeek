@@ -126,6 +126,9 @@ run_*.txt
 # Temp / scratch files
 # ─────────────────────────────────────────────
 git_status*
+train_output*
+train_*_log.txt
+train_out_*.txt
 *.tmp
 *.bak
 
